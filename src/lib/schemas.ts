@@ -46,6 +46,35 @@ export const outreachResultSchema = z.object({
 
 export type OutreachResult = z.infer<typeof outreachResultSchema>;
 
+/**
+ * A lead discovered by AI from live web search results. Every field must be
+ * traceable to one of the supplied search results — the route drops any entry
+ * whose sourceUrl was not actually fetched.
+ */
+export const discoveredLeadSchema = z.object({
+  playerName: z.string().min(1),
+  contactName: z.string().default(""),
+  contactType: z
+    .enum(["parent", "athlete", "coach", "team", "agency", "unknown"])
+    .default("unknown"),
+  sport: z.string().default(""),
+  team: z.string().default(""),
+  position: z.string().default(""),
+  graduationYear: z.number().int().min(2000).max(2045).nullable().default(null),
+  sourceUrl: z.string().min(1),
+  sourceTitle: z.string().default(""),
+  whyThisLead: z.string().default(""),
+  confidence: z.enum(["low", "medium", "high"]).default("low"),
+});
+
+export type DiscoveredLead = z.infer<typeof discoveredLeadSchema>;
+
+export const discoveredLeadsSchema = z.object({
+  leads: z.array(discoveredLeadSchema).default([]),
+});
+
+export type DiscoveredLeads = z.infer<typeof discoveredLeadsSchema>;
+
 export const COMMAND_ACTIONS = [
   "show_leads",
   "show_games",

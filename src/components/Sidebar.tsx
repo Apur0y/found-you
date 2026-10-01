@@ -4,13 +4,12 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const NAV = [
-  { href: "/", label: "Dashboard", icon: "▦" },
-  { href: "/games", label: "Games", icon: "▶" },
-  { href: "/leads", label: "Leads", icon: "◎" },
-  { href: "/websites", label: "Websites", icon: "◈" },
-  { href: "/outreach", label: "Outreach", icon: "✉" },
-  { href: "/command", label: "Command Center", icon: "⌘" },
-  { href: "/settings", label: "Settings", icon: "⚙" },
+  { href: "/", match: ["/", "/leads"], label: "Leads", icon: "◎" },
+  { href: "/games", match: ["/games"], label: "Games", icon: "▶" },
+  { href: "/websites", match: ["/websites"], label: "Websites", icon: "◈" },
+  { href: "/outreach", match: ["/outreach"], label: "Outreach", icon: "✉" },
+  { href: "/command", match: ["/command"], label: "Command Center", icon: "⌘" },
+  { href: "/settings", match: ["/settings"], label: "Settings", icon: "⚙" },
 ];
 
 export function Sidebar() {
@@ -33,10 +32,9 @@ export function Sidebar() {
       </div>
       <nav className="flex-1 space-y-1 px-3 py-4">
         {NAV.map((item) => {
-          const active =
-            item.href === "/"
-              ? pathname === "/"
-              : pathname.startsWith(item.href);
+          const active = item.match.some(
+            (p) => (p === "/" ? pathname === "/" : pathname.startsWith(p))
+          );
           return (
             <Link
               key={item.href}

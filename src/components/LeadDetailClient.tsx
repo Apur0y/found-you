@@ -172,7 +172,7 @@ export function LeadDetailClient({
     setBusy("delete");
     try {
       await clientFetch(`/api/leads/${lead._id}`, { method: "DELETE" });
-      router.push("/leads");
+      router.push("/");
     } finally {
       setBusy(null);
     }

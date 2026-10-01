@@ -93,7 +93,7 @@ export function CommandRunner({ compact = false }: { compact?: boolean }) {
             <span className="text-zinc-900">{result.explanation}</span>
             {result.leads ? (
               <Link
-                href="/leads"
+                href="/"
                 className="ml-2 text-xs font-medium text-zinc-600 underline underline-offset-2 hover:text-zinc-900"
               >
                 {result.leads.length} lead{result.leads.length === 1 ? "" : "s"} matched →
