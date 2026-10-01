@@ -37,6 +37,8 @@ interface FetchReport {
   pageFetchFailures: Array<{ url: string; reason: string }>;
   targets: string[];
   windowLabel: string;
+  linkedGame: { id: string; title: string; date: string } | null;
+  linkedGameWithinWindow: boolean;
 }
 
 type MatchSort = "off" | "earliest" | "latest";
@@ -55,6 +57,18 @@ const MATCH_SORT_NEXT: Record<MatchSort, MatchSort> = {
 
 const RECENT_WINDOW_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+function startOfDay(value: Date | number): number {
+  const d = new Date(value);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+function endOfDay(value: Date | number): number {
+  const d = new Date(value);
+  d.setHours(23, 59, 59, 999);
+  return d.getTime();
+}
 
 function matchTime(game: Game | undefined): number | null {
   if (!game?.date) return null;
@@ -157,10 +171,29 @@ export default function HomePage() {
     });
   }, [leads, games, matchSort]);
 
+  // Calendar days, not a rolling 168 hours: a game played at midnight on the
+  // boundary day still counts, which matches how the fetch window is built.
+  const recentWindow = useMemo(() => {
+    if (!fetchedAt) return null;
+    const windowEnd = endOfDay(fetchedAt);
+    const windowStart = startOfDay(
+      new Date(windowEnd - (RECENT_WINDOW_DAYS - 1) * DAY_MS)
+    );
+    return { windowStart, windowEnd };
+  }, [fetchedAt]);
+
+  const newestGameDate = useMemo(() => {
+    let newest: number | null = null;
+    for (const game of games.values()) {
+      const t = matchTime(game);
+      if (t !== null && (newest === null || t > newest)) newest = t;
+    }
+    return newest;
+  }, [games]);
+
   const recentGameLeads = useMemo(() => {
-    if (!fetchedAt) return [];
-    const windowEnd = fetchedAt.getTime();
-    const windowStart = windowEnd - RECENT_WINDOW_DAYS * DAY_MS;
+    if (!recentWindow) return [];
+    const { windowStart, windowEnd } = recentWindow;
     return leads
       .map((lead) => {
         const game = lead.gameId ? games.get(lead.gameId) : undefined;
@@ -170,7 +203,7 @@ export default function HomePage() {
       })
       .filter((entry): entry is { lead: Lead; game: Game; time: number } => entry !== null)
       .sort((a, b) => b.time - a.time);
-  }, [leads, games, fetchedAt]);
+  }, [leads, games, recentWindow]);
 
   function applyFilters(e: React.FormEvent) {
     e.preventDefault();
@@ -340,6 +373,17 @@ export default function HomePage() {
             <div>
               Queries: {fetchReport.queries.length ? fetchReport.queries.join("  |  ") : "—"}
             </div>
+            {fetchReport.created.length > 0 ? (
+              <div>
+                {fetchReport.linkedGame
+                  ? fetchReport.linkedGameWithinWindow
+                    ? `Linked to newest game in window: ${fetchReport.linkedGame.title} (unverified — the source page did not name a game)`
+                    : `Linked to newest game: ${fetchReport.linkedGame.title}, played ${formatDate(
+                        fetchReport.linkedGame.date
+                      )} — outside the ${RECENT_WINDOW_DAYS}-day window, so these leads show in the list but not the “Played in the last ${RECENT_WINDOW_DAYS} days” card`
+                  : "No dated game found, so these leads were not linked to a game."}
+              </div>
+            ) : null}
             {fetchReport.sources.length ? (
               <details>
                 <summary className="cursor-pointer">
@@ -388,7 +432,11 @@ export default function HomePage() {
         <Card>
           <CardHeader
             title={`Played in the last ${RECENT_WINDOW_DAYS} days`}
-            subtitle={`${recentGameLeads.length} lead${recentGameLeads.length === 1 ? "" : "s"} linked to a game played between ${formatDate(new Date(fetchedAt.getTime() - RECENT_WINDOW_DAYS * DAY_MS).toISOString())} and ${formatDate(fetchedAt.toISOString())} · newest match first`}
+            subtitle={
+              recentWindow
+                ? `${recentGameLeads.length} lead${recentGameLeads.length === 1 ? "" : "s"} linked to a game played between ${formatDate(new Date(recentWindow.windowStart).toISOString())} and ${formatDate(new Date(recentWindow.windowEnd).toISOString())} · newest match first`
+                : undefined
+            }
             action={
               <span className="whitespace-nowrap text-[11px] text-zinc-400">
                 Fetched {formatDateTime(fetchedAt.toISOString())}
@@ -398,7 +446,11 @@ export default function HomePage() {
           {recentGameLeads.length === 0 ? (
             <EmptyState
               title={`No games played in the last ${RECENT_WINDOW_DAYS} days`}
-              note="Link a lead to a recent game on the Games page, then fetch again."
+              note={
+                newestGameDate !== null
+                  ? `Newest game on file was played ${formatDate(new Date(newestGameDate).toISOString())}, which is outside this window. Record a game in the last ${RECENT_WINDOW_DAYS} days, or link a lead to it, then fetch again.`
+                  : "Record a game, or link a lead to one, then fetch again."
+              }
             />
           ) : (
             <ul className="divide-y divide-zinc-100">

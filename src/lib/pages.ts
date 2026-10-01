@@ -92,27 +92,45 @@ export async function fetchPageText(url: string): Promise<FetchedPage> {
   };
 }
 
-/** Fetches pages sequentially — small volume, and sequential avoids hammering. */
+/**
+ * Fetches pages with bounded concurrency. Sequential fetching made a fetch take
+ * as long as the sum of every page timeout; a small pool reduces it to roughly
+ * the slowest single page while still staying polite.
+ */
 export async function fetchPages(
-  urls: string[]
+  urls: string[],
+  concurrency = 4
 ): Promise<{ pages: FetchedPage[]; failures: Array<{ url: string; reason: string }> }> {
-  const pages: FetchedPage[] = [];
-  const failures: Array<{ url: string; reason: string }> = [];
+  const unique: string[] = [];
   const seen = new Set<string>();
-
   for (const url of urls) {
     const key = url.replace(/#.*$/, "").replace(/\/+$/, "");
     if (seen.has(key)) continue;
     seen.add(key);
-    try {
-      pages.push(await fetchPageText(url));
-    } catch (err) {
-      failures.push({
-        url,
-        reason: err instanceof Error ? err.message.slice(0, 120) : "unknown error",
-      });
-    }
+    unique.push(url);
   }
+
+  const pages: FetchedPage[] = [];
+  const failures: Array<{ url: string; reason: string }> = [];
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < unique.length) {
+      const url = unique[cursor++];
+      try {
+        pages.push(await fetchPageText(url));
+      } catch (err) {
+        failures.push({
+          url,
+          reason: err instanceof Error ? err.message.slice(0, 120) : "unknown error",
+        });
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, unique.length) }, () => worker())
+  );
 
   return { pages, failures };
 }

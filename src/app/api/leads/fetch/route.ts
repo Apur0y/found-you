@@ -64,9 +64,39 @@ function buildQueries(
   return { queries: [...new Set(queries)], targets };
 }
 
-function toLeadDoc(lead: DiscoveredLead, windowLabel: string) {
+type NewestGame = { id: string; title: string; date: string } | null;
+
+/**
+ * Picks the most recent game that actually has a play date. Mongo sorts
+ * date-less documents last on a descending sort, but we check explicitly so a
+ * lead is never attributed to a game with no date.
+ */
+function pickNewestGame(
+  games: Array<{ _id: unknown; title: string; date?: Date | string | null }>
+): NewestGame {
+  const dated = games
+    .filter((g) => g.date)
+    .sort((a, b) => new Date(b.date!).getTime() - new Date(a.date!).getTime());
+  const game = dated[0];
+  return game
+    ? {
+        id: String(game._id),
+        title: game.title,
+        date: new Date(game.date!).toISOString(),
+      }
+    : null;
+}
+
+function toLeadDoc(lead: DiscoveredLead, windowLabel: string, newestGame: NewestGame) {
   const playerName = lead.playerName.trim();
   const contactName = lead.contactName.trim();
+
+  // Web pages never name the recorded game a lead came from, so the link is an
+  // operator-facing convenience and is always recorded as inferred, not verified.
+  const gameLinkNote = newestGame
+    ? `Linked to "${newestGame.title}", the most recent game in the window. The source page did not name this game, so the match is unverified.`
+    : null;
+
   return {
     name: contactName || playerName,
     playerName,
@@ -76,10 +106,14 @@ function toLeadDoc(lead: DiscoveredLead, windowLabel: string) {
     position: lead.position.trim() || undefined,
     graduationYear: lead.graduationYear ?? undefined,
     profileUrl: lead.sourceUrl,
+    gameId: newestGame?.id ?? null,
     source: "ai-web-fetch",
     status: "new" as const,
     verifiedInformation: [],
-    inferredInformation: lead.whyThisLead ? [lead.whyThisLead] : [],
+    inferredInformation: [
+      ...(lead.whyThisLead ? [lead.whyThisLead] : []),
+      ...(gameLinkNote ? [gameLinkNote] : []),
+    ],
     missingInformation: [
       "No contact email, phone, or social profile has been verified yet.",
     ],
@@ -91,8 +125,11 @@ function toLeadDoc(lead: DiscoveredLead, windowLabel: string) {
         kind: "ai_inferred" as const,
         source: lead.sourceUrl,
       },
+      ...(gameLinkNote
+        ? [{ text: gameLinkNote, kind: "ai_inferred" as const }]
+        : []),
     ],
-    notes: `AI web fetch · ${windowLabel} · source: ${lead.sourceTitle || lead.sourceUrl}`,
+    notes: `AI web fetch · ${windowLabel}${newestGame ? ` · linked to newest game: ${newestGame.title}` : ""} · source: ${lead.sourceTitle || lead.sourceUrl}`,
   };
 }
 
@@ -112,10 +149,17 @@ export async function POST(request: Request) {
     MAX_CREATED
   );
 
-  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000);
-  const windowLabel = `games played within ${windowDays} day(s) ending ${since
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  // Calendar days, matching the client card: a game played at midnight on the
+  // boundary day is inside the window.
+  const since = new Date(
+    todayStart.getTime() - (windowDays - 1) * 24 * 60 * 60 * 1000
+  );
+  const windowLabel = `games played on the last ${windowDays} calendar day(s), ${since
     .toISOString()
-    .slice(0, 10)}`;
+    .slice(0, 10)} to ${now.toISOString().slice(0, 10)}`;
 
   try {
     const [websites, games] = await Promise.all([
@@ -135,6 +179,10 @@ export async function POST(request: Request) {
         teamA: g.teamA,
         teamB: g.teamB,
       }))
+    );
+
+    const newestGame = pickNewestGame(
+      serialize<Array<{ _id: string; title: string; date: Date | null }>>(games)
     );
 
     if (queries.length === 0) {
@@ -237,7 +285,9 @@ export async function POST(request: Request) {
     }
 
     const savedDocs = created.length
-      ? await Lead.insertMany(created.map((lead) => toLeadDoc(lead, windowLabel)))
+      ? await Lead.insertMany(
+          created.map((lead) => toLeadDoc(lead, windowLabel, newestGame))
+        )
       : [];
 
     return Response.json(
@@ -252,6 +302,13 @@ export async function POST(request: Request) {
         targets,
         windowLabel,
         pageFetchFailures: failures,
+        linkedGame: newestGame,
+        // Lets the UI explain why attached leads may not appear in the
+        // "played in the last 7 days" card.
+        linkedGameWithinWindow: newestGame
+          ? new Date(newestGame.date).getTime() >= since.getTime() &&
+            new Date(newestGame.date).getTime() <= now.getTime()
+          : false,
       },
       { status: created.length > 0 ? 201 : 200 }
     );

@@ -43,17 +43,32 @@ export async function testGemini(): Promise<{
   }
 }
 
-async function generateContentOnce(
+/**
+ * Flash models are frequently overloaded ("high demand", 503) on shared keys.
+ * These alternates are tried in order when the configured model fails with a
+ * transient error, so a fetch does not fail just because one model is busy.
+ */
+const FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest"];
+
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+
+async function callOnce(
+  model: string,
   system: string,
   user: string,
-  opts?: { json?: boolean; maxOutputTokens?: number; tools?: unknown[] }
+  opts?: {
+    json?: boolean;
+    maxOutputTokens?: number;
+    tools?: unknown[];
+    thinkingBudget?: number;
+  }
 ): Promise<string> {
   if (!isGeminiConfigured()) {
     throw new Error(
       "GEMINI_API_KEY is not set. Add it to .env.local and restart the server."
     );
   }
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
     GEMINI_API_KEY
   )}`;
   const body = {
@@ -63,6 +78,9 @@ async function generateContentOnce(
       temperature: 0.1,
       maxOutputTokens: opts?.maxOutputTokens ?? 2048,
       ...(opts?.json ? { responseMimeType: "application/json" } : {}),
+      ...(opts?.thinkingBudget !== undefined
+        ? { thinkingConfig: { thinkingBudget: opts.thinkingBudget } }
+        : {}),
     },
     ...(opts?.tools?.length ? { tools: opts.tools } : {}),
   };
@@ -86,13 +104,24 @@ async function generateContentOnce(
     }
     throw new GeminiError(detail || `Gemini API error ${res.status}`, res.status);
   }
+
   const payload = (await res.json()) as {
-    candidates?: { content?: { parts?: { text?: string }[] } }[];
+    candidates?: {
+      content?: { parts?: { text?: string }[] };
+      finishReason?: string;
+    }[];
   };
-  const text = payload.candidates?.[0]?.content?.parts
+  const candidate = payload.candidates?.[0];
+  const text = candidate?.content?.parts
     ?.map((p) => p.text ?? "")
     .join("");
-  if (!text) throw new Error("Gemini returned an empty response");
+
+  if (!text) {
+    // MAX_TOKENS with no text means the budget was consumed before any visible
+    // output (reasoning models spend tokens on thinking first). Retryable.
+    const reason = candidate?.finishReason ?? "empty";
+    throw new GeminiError(`Gemini returned no content (${reason})`, 503);
+  }
   return text;
 }
 
@@ -106,27 +135,71 @@ export class GeminiError extends Error {
 }
 
 /**
- * Retries transient upstream failures. Flash models spike under load and the
- * free tier is frequently rate limited; both are worth another attempt. Auth
- * and malformed-request errors are not retried.
+ * Tries the configured model, then alternates, retrying transient upstream
+ * failures with backoff. Auth and malformed-request errors fail fast.
  */
 async function generateContent(
   system: string,
   user: string,
-  opts?: { json?: boolean; maxOutputTokens?: number; tools?: unknown[] }
+  opts?: {
+    json?: boolean;
+    maxOutputTokens?: number;
+    tools?: unknown[];
+    thinkingBudget?: number;
+  }
 ): Promise<string> {
-  const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+  const models = [
+    GEMINI_MODEL,
+    ...FALLBACK_MODELS.filter((m) => m !== GEMINI_MODEL),
+  ];
   let lastError: unknown;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const attempt = async (
+    model: string,
+    options: typeof opts
+  ): Promise<string> => {
     try {
-      return await generateContentOnce(system, user, opts);
+      return await callOnce(model, system, user, options);
     } catch (err) {
       lastError = err;
       const status = err instanceof GeminiError ? err.status : 0;
-      if (!RETRYABLE.has(status) || attempt === 2) throw err;
+
+      // Not every model accepts `thinkingConfig`; retry once without it rather
+      // than failing a request that a fallback model could have served.
+      if (status === 400 && options?.thinkingBudget !== undefined) {
+        try {
+          return await callOnce(model, system, user, {
+            ...options,
+            thinkingBudget: undefined,
+          });
+        } catch (retryErr) {
+          lastError = retryErr;
+          const retryStatus =
+            retryErr instanceof GeminiError ? retryErr.status : 0;
+          if (!RETRYABLE_STATUS.has(retryStatus)) throw retryErr;
+          return Promise.reject(retryErr);
+        }
+      }
+
+      if (!RETRYABLE_STATUS.has(status)) throw err;
+      return Promise.reject(err);
+    }
+  };
+
+  for (let round = 0; round < 3; round++) {
+    for (const model of models) {
+      try {
+        return await attempt(model, opts);
+      } catch (err) {
+        // Already non-retryable; move on to the next model.
+        if (!RETRYABLE_STATUS.has(err instanceof GeminiError ? err.status : 0)) {
+          lastError = err;
+        }
+      }
+    }
+    if (round < 2) {
       await new Promise((resolve) =>
-        setTimeout(resolve, 800 * Math.pow(2, attempt))
+        setTimeout(resolve, 700 * Math.pow(2, round))
       );
     }
   }
@@ -350,23 +423,28 @@ Return JSON only: { "message": string }`;
 let groundingProbe: Promise<boolean> | null = null;
 
 /**
- * Only a quota/scope problem counts as "grounding unavailable". A transient
- * overload must not permanently disable the capability, so the probe result is
- * only cached once it succeeds or fails for a non-retryable reason.
+ * Probes directly against the configured model with no retries or fallbacks.
+ * Search grounding quota is a project-level setting, so one call answers the
+ * question, and a failure here must be cheap — it runs on every fetch request
+ * until it resolves.
  */
 export function isSearchGroundingAvailable(): Promise<boolean> {
-  groundingProbe ??= generateContent(
+  groundingProbe ??= callOnce(
+    GEMINI_MODEL,
     "You are a search probe.",
     "Reply with the single word ok.",
-    { json: false, maxOutputTokens: 8, tools: [{ google_search: {} }] }
+    {
+      json: false,
+      maxOutputTokens: 256,
+      thinkingBudget: 0,
+      tools: [{ google_search: {} }],
+    }
   )
     .then(() => true)
     .catch((err) => {
       const status = err instanceof GeminiError ? err.status : 0;
-      if (status === 429 || status === 403) {
-        return false;
-      }
-      groundingProbe = null; // retry the probe next time
+      if (status === 429 || status === 403) return false;
+      groundingProbe = null; // transient — probe again next time
       throw err;
     });
   return groundingProbe;
@@ -460,15 +538,17 @@ export async function discoverLeads(input: {
 
 What the business sells: ${input.serviceDescription}
 
-Focus areas requested by the operator:
+Context from the operator — INFORMATIONAL ONLY, NOT A FILTER:
 ${input.targets.map((t) => `- ${t}`).join("\n")}
+Extract every individual you find. Do NOT restrict results to the context above; those are
+only hints about where the operator usually looks.
 
 PAGE TEXTS
 """
 ${block}
 """
 
-Extract individual people who could be contacted about recruiting/highlight video work.
+Extract EVERY individual named anywhere in the page texts above who could be contacted about recruiting/highlight video work.
 
 Hard rules:
 - Only output a person whose full name appears verbatim in the page texts above. Never guess or reconstruct names.
@@ -478,7 +558,8 @@ Hard rules:
 - graduationYear only when a class year or birth year is stated in the text; otherwise null.
 - Roster, rankings, all-star, and team-schedule pages ARE good sources: if the text names individual athletes (even with only a rank and position), extract them.
 - Skip only pages that name no individual at all: homepages, navigation, forums, shops, and sports-business commentary.
-- At most ${input.maxLeads ?? 10} leads. Fewer is better than padding.
+- If any page names even one person, that person belongs in the output.
+- At most ${input.maxLeads ?? 10} leads. Fewer is better than padding, but never return zero when a named person exists.
 
 Return JSON only:
 { "leads": [ { "playerName": string, "contactName": string, "contactType": "parent"|"athlete"|"coach"|"team"|"unknown", "sport": string, "team": string, "position": string, "graduationYear": number|null, "sourceUrl": string, "sourceTitle": string, "whyThisLead": string, "confidence": "low"|"medium"|"high" } ] }`;
@@ -486,7 +567,14 @@ Return JSON only:
   const system =
     "You extract lead candidates from real search results. Every name and URL must come from the supplied text. Never fabricate. JSON only.";
 
-  const text = await generateContent(system, user, { json: true, maxOutputTokens: 8192 });
+  const text = await generateContent(system, user, {
+    json: true,
+    maxOutputTokens: 16384,
+    // Extraction is a mechanical, low-temperature task. Extended thinking made
+    // this call slower and pushed it into capacity limits (503) without
+    // improving extraction quality.
+    thinkingBudget: 0,
+  });
   const parsed = await parseJson(discoveredLeadsSchema, text);
 
   // Hard guarantee: discard anything not traceable to a fetched URL.
